@@ -39,6 +39,41 @@ function extractRowFromPageText(pageText: string, pageIndex: number): ExtractedR
   }
 }
 
+function buildPageTextFromItems(items: any[]): string {
+  // Map items to {x,y,str}
+  const mapped = items.map((it) => {
+    const transform = (it as any).transform || (it as any).tm || null
+    const x = transform && transform.length >= 6 ? transform[4] : 0
+    const y = transform && transform.length >= 6 ? transform[5] : 0
+    const str = 'str' in it ? it.str : ''
+    return { x, y, str }
+  })
+
+  // Group by Y coordinate with a small tolerance
+  const groups: { y: number; items: { x: number; str: string }[] }[] = []
+
+  for (const m of mapped) {
+    const found = groups.find((g) => Math.abs(g.y - m.y) < 2)
+    if (found) {
+      found.items.push({ x: m.x, str: m.str })
+    } else {
+      groups.push({ y: m.y, items: [{ x: m.x, str: m.str }] })
+    }
+  }
+
+  // Sort groups top-to-bottom (higher y first) and items left-to-right
+  groups.sort((a, b) => b.y - a.y)
+
+  const lines = groups.map((g) =>
+    g.items
+      .sort((a, b) => a.x - b.x)
+      .map((i) => i.str)
+      .join(' '),
+  )
+
+  return lines.join('\n')
+}
+
 function extractRowsFromPdfText(pageText: string, pageIndex: number): ExtractedRow[] {
   const normalizedText = pageText.replace(/\r\n?/g, '\n').replace(/[\u00a0\t]+/g, ' ')
   const rows: ExtractedRow[] = []
@@ -65,6 +100,73 @@ function extractRowsFromPdfText(pageText: string, pageIndex: number): ExtractedR
   if (rows.length > 0) {
     return rows
   }
+
+  // Fallback: try a more resilient line-based parse when the strict regex fails.
+  const lines = normalizedText.split('\n').map((l) => l.trim()).filter(Boolean)
+
+  function parseLine(line: string): ExtractedRow | null {
+    // 1) Pipe separated columns
+    if (line.includes('|')) {
+      const parts = line.split('|').map((p) => p.trim()).filter(Boolean)
+      // product | sku | ... | qty  OR product | sku | qty
+      if (parts.length >= 3) {
+        const possibleQty = parts[parts.length - 1].match(/(\d+)/)
+        const qty = possibleQty ? Number.parseInt(possibleQty[0], 10) : NaN
+        const productName = parts[0]
+        const sku = parts[1]
+        if (productName && sku && !Number.isNaN(qty)) {
+          return { pageIndex, productName, sku, qty }
+        }
+      }
+    }
+
+    // 2) Split by large whitespace (column alignment)
+    const spaced = line.split(/\s{2,}/).map((p) => p.trim()).filter(Boolean)
+    if (spaced.length >= 3) {
+      const possibleQty = spaced[spaced.length - 1].match(/(\d+)/)
+      const qty = possibleQty ? Number.parseInt(possibleQty[0], 10) : NaN
+      const productName = spaced[0]
+      const sku = spaced[1]
+      if (productName && sku && !Number.isNaN(qty)) {
+        return { pageIndex, productName, sku, qty }
+      }
+    }
+
+    // 3) Try looser regex: product ... SKU xxx ... qty
+    const skuRegex = /(?<name>.*?)\bSKU[:\s]*?(?<sku>[A-Za-z0-9-]+)\b.*?(?<qty>\d+)$/i
+    const skuMatch = line.match(skuRegex)
+    if (skuMatch && skuMatch.groups) {
+      const productName = skuMatch.groups.name.trim()
+      const sku = skuMatch.groups.sku.trim()
+      const qty = Number.parseInt(skuMatch.groups.qty, 10)
+      if (productName && sku && !Number.isNaN(qty)) {
+        return { pageIndex, productName, sku, qty }
+      }
+    }
+
+    // 4) Very loose fallback: last token number, penultimate token looks like SKU
+    const loose = line.match(/^(?<name>.*\S)\s+(?<sku>[A-Za-z0-9-]{2,})\s+(?<qty>\d+)$/)
+    if (loose && loose.groups) {
+      const productName = loose.groups.name.trim()
+      const sku = loose.groups.sku.trim()
+      const qty = Number.parseInt(loose.groups.qty, 10)
+      if (productName && sku && !Number.isNaN(qty)) {
+        return { pageIndex, productName, sku, qty }
+      }
+    }
+
+    return null
+  }
+
+  for (const line of lines) {
+    const parsed = parseLine(line)
+
+    if (parsed) {
+      rows.push(parsed)
+    }
+  }
+
+  if (rows.length > 0) return rows
 
   const fallbackRow = extractRowFromPageText(normalizedText, pageIndex)
 
@@ -155,7 +257,8 @@ function App() {
         return
       }
 
-      setUploadedPdfBytes(arrayBuffer)
+      // Store a copy of the ArrayBuffer to avoid it being detached by other libs (pdf.js)
+      setUploadedPdfBytes(arrayBuffer.slice(0))
       setStatusMessage('Extracting text from PDF...')
 
       const loadingTask = getDocument({ data: arrayBuffer })
@@ -174,9 +277,14 @@ function App() {
 
           try {
             const textContent = await page.getTextContent()
-            const pageText = textContent.items
-              .map((item) => ('str' in item ? item.str : ''))
-              .join(' ')
+
+            const pageText = buildPageTextFromItems(textContent.items as any[])
+
+            // Print raw reconstructed text for the first page to aid debugging in the browser console
+            if (pageIndex === 1) {
+              // eslint-disable-next-line no-console
+              console.log('PDF raw pageText (reconstructed lines):\n', pageText)
+            }
 
             rows.push(...extractRowsFromPdfText(pageText, pageIndex))
           } finally {
@@ -224,34 +332,81 @@ function App() {
     setStatusMessage('Building sorted PDF...')
 
     try {
-      const sourcePdf = await PDFDocument.load(uploadedPdfBytes)
+      // Ensure we pass a raw ArrayBuffer/Uint8Array to pdf-lib
+      // Create a copied Uint8Array to avoid working with a potentially detached ArrayBuffer
+      const sourceBuffer =
+        uploadedPdfBytes instanceof Uint8Array
+          ? uploadedPdfBytes.slice()
+          : new Uint8Array((uploadedPdfBytes as ArrayBuffer).slice(0))
+
+      let sourcePdf: PDFDocument
+      try {
+        console.log('Process & Download: loading source PDF with pdf-lib (bytes length):', sourceBuffer.byteLength)
+        sourcePdf = await PDFDocument.load(sourceBuffer)
+      } catch (err) {
+        console.error('Failed to load source PDF with pdf-lib:', err)
+        throw err
+      }
+
       const outputPdf = await PDFDocument.create()
-      const copiedPages = await outputPdf.copyPages(
-        sourcePdf,
-        extractedRows.map((row) => row.pageIndex - 1),
-      )
 
-      copiedPages.forEach((page) => {
-        outputPdf.addPage(page)
-      })
+      // Map to zero-based indices and validate
+      const zeroBasedIndices = extractedRows.map((row) => row.pageIndex - 1)
+      const pageCount = typeof (sourcePdf as any).getPageCount === 'function' ? (sourcePdf as any).getPageCount() : undefined
 
-      const sortedPdfBytes = await outputPdf.save()
-      const blob = new Blob([new Uint8Array(sortedPdfBytes).buffer], {
-        type: 'application/pdf',
-      })
-      const downloadUrl = URL.createObjectURL(blob)
-      const anchor = document.createElement('a')
+      if (typeof pageCount === 'number') {
+        console.log('Process & Download: source PDF pageCount:', pageCount)
+        const outOfRange = zeroBasedIndices.some((i) => i < 0 || i >= pageCount)
+        if (outOfRange) {
+          console.error('One or more page indices are out of range', { pageCount, zeroBasedIndices })
+          throw new Error('Page index out of range')
+        }
+      } else {
+        console.log('Process & Download: sourcePdf.getPageCount() not available')
+      }
 
-      anchor.href = downloadUrl
-      anchor.download = 'Sorted_Orders.pdf'
-      anchor.rel = 'noreferrer'
-      document.body.appendChild(anchor)
-      anchor.click()
-      anchor.remove()
-      URL.revokeObjectURL(downloadUrl)
+      let copiedPages
+      try {
+        console.log('Process & Download: copying pages, indices:', zeroBasedIndices)
+        copiedPages = await outputPdf.copyPages(sourcePdf, zeroBasedIndices)
+      } catch (err) {
+        console.error('Failed to copy pages from source PDF:', err)
+        throw err
+      }
+
+      copiedPages.forEach((page) => outputPdf.addPage(page))
+
+      let sortedPdfBytes: Uint8Array
+      try {
+        console.log('Process & Download: saving output PDF...')
+        sortedPdfBytes = await outputPdf.save()
+        console.log('Process & Download: saved output PDF bytes length:', sortedPdfBytes.length)
+      } catch (err) {
+        console.error('Failed to save generated PDF bytes:', err)
+        throw err
+      }
+
+      try {
+        console.log('Process & Download: creating Blob and triggering download')
+        const blob = new Blob([sortedPdfBytes], { type: 'application/pdf' })
+        const downloadUrl = URL.createObjectURL(blob)
+        const anchor = document.createElement('a')
+
+        anchor.href = downloadUrl
+        anchor.download = 'Sorted_Orders.pdf'
+        anchor.rel = 'noreferrer'
+        document.body.appendChild(anchor)
+        anchor.click()
+        anchor.remove()
+        URL.revokeObjectURL(downloadUrl)
+      } catch (err) {
+        console.error('Failed to create or trigger download for the sorted PDF:', err)
+        throw err
+      }
 
       setStatusMessage('Sorted_Orders.pdf has been downloaded.')
-    } catch {
+    } catch (err) {
+      console.error('Process & Download: an error occurred', err)
       setStatusMessage('The sorted PDF could not be generated. Please try again.')
     } finally {
       setIsGenerating(false)
